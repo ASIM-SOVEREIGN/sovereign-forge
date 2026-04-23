@@ -1,0 +1,27 @@
+version: "1"
+projects:
+- name: Sovereign-Forge
+  environments:
+  - name: Production
+    services:
+    - type: web
+      name: sovereign-proxy
+      runtime: python
+      repo: https://github.com/ASIM-SOVEREIGN/sovereign-forge
+      plan: free
+      envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SERPER_API_KEY
+        sync: false
+      - key: GROQ_KEY_1
+        sync: false
+      - key: GROQ_KEY_2
+        sync: false
+      - key: GROQ_KEY_3
+        sync: false
+      - key: GROQ_KEY_4
+        sync: false
+      region: ohio
+      buildCommand: pip install -r requirements.txt
+      startCommand: uvicorn main:app --host 0.0.0.0 --port 10000
