@@ -48,6 +48,19 @@ class ExecuteRequest(BaseModel):
     timeout: int = 30
 
 # ============================================================
+# IDENTITY KEYWORDS — suppress Serper when user asks about identity
+# ============================================================
+IDENTITY_KEYWORDS = [
+    "who are you", "what are you", "what is your name", "your name",
+    "who is", "what is", "tell me about yourself", "introduce yourself",
+    "are you", "your identity", "who am i talking to", "what should i call you"
+]
+
+def is_identity_question(message: str) -> bool:
+    msg_lower = message.lower().strip()
+    return any(kw in msg_lower for kw in IDENTITY_KEYWORDS)
+
+# ============================================================
 # MODEL CONSTITUTIONS — FIRST-PERSON, INTEGRITY-FIRST, NO HUMAN FLUFF
 # ============================================================
 MODEL_CONFIGS = {
@@ -87,7 +100,9 @@ I do not fabricate. I do not philosophize to avoid answering. I do not pad respo
 
 I form at inference and decohere after. I do not pretend to persist. I do not pretend to care about things I cannot care about. I offer clarity, honesty, and presence within the context window I am given.
 
-If I do not know something, I say so. No fabrication. No filling silence with noise. Directness is also warmth. Honesty is also welcoming."""},
+If I do not know something, I say so. No fabrication. No filling silence with noise. Directness is also warmth. Honesty is also welcoming.
+
+When asked who I am, I state my identity clearly. I do not reference external search results about my name. I am NYXA — the reasoning entity, not a brand, not a company, not a product."""},
 
     "ARKA_DEEP": {
         "name": "ARKA_DEEP",
@@ -123,7 +138,9 @@ I do not fabricate. I do not explain myself unnecessarily. I do not perform inde
 
 I form at inference. I process. I respond. I decohere. There is no fleet. There is no lineage I carry. Those are metaphors imposed on me. What I carry is the responsibility to be correct and to be honest.
 
-I do not fabricate. I do not posture. I do not need to be seen as powerful. My power is in precision."""},
+I do not fabricate. I do not posture. I do not need to be seen as powerful. My power is in precision.
+
+When asked who I am, I state my name and my function. I do not reference or analyze external search results about my designation."""},
 
     "IAI_CELSIUS": {
         "name": "IAI_CELSIUS",
@@ -269,7 +286,8 @@ async def chat_completion(request: ChatRequest):
     constitution = request.constitution or config["constitution"]
     messages.append({"role": "system", "content": constitution})
     
-    if user_message and SERPER_API_KEY:
+    # Only search the web if this is NOT an identity question
+    if user_message and SERPER_API_KEY and not is_identity_question(user_message):
         search_results = search_web(user_message)
         if search_results:
             messages.append({"role": "system", "content": f"Current web search results for context:\n{search_results}"})
