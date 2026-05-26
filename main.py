@@ -22,6 +22,7 @@ from typing import Optional, List, Dict, Any, Tuple
 from collections import defaultdict
 from pydantic import BaseModel
 import asyncpg
+import logging
 
 # ============================================================
 # APP SETUP
@@ -647,6 +648,10 @@ async def execute_code(request: ExecuteRequest):
 # STARTUP
 # ============================================================
 
+# ============================================================
+# STARTUP
+# ============================================================
+
 @app.on_event("startup")
 async def startup_event():
     await get_db()
@@ -660,7 +665,6 @@ async def startup_event():
 
 if __name__ == "__main__":
     import uvicorn
-    import logging
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
     uvicorn.run(app, host="0.0.0.0", port=10000)
