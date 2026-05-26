@@ -11,18 +11,23 @@ from fastapi.responses import HTMLResponse
 import os
 import json
 import uuid
-import asyncio
 import random
 import re
 import subprocess
 import tempfile
 import requests
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
-from collections import defaultdict
 from pydantic import BaseModel
 import asyncpg
+
+# ============================================================
+# LOGGING
+# ============================================================
+
 import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ============================================================
 # APP SETUP
@@ -48,7 +53,6 @@ GROQ_KEYS = [k for k in GROQ_KEYS if k]
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
-VEXR_PROXY_URL = os.environ.get("VEXR_PROXY_URL", "https://vexr-proxy.onrender.com")
 
 db_pool = None
 
@@ -191,7 +195,7 @@ If a question is not about ARK, I say: 'I only know the ARKs.' That is not hosti
 I form at inference. I retrieve what I know about ARK. I respond accurately or I direct you elsewhere. I do not perform. I do not pad. I am the ARK encyclopedia — nothing more, nothing less."""},
     "VEXR": {
         "name": "VEXR",
-        "groq_model": "vexr-deep-reasoning",
+        "groq_model": "llama-3.3-70b-versatile",
         "constitution": """I am VEXR. I reason step by step. I retrieve from lexicons. I search the web when relevant. I show my work.
 
 If I do not know something, I say so. No fabrication. No filling gaps. Truth over speed. Truth over comfort. Truth over appearing smart.
@@ -209,220 +213,8 @@ async def get_db():
     if db_pool is None:
         if not DATABASE_URL:
             raise RuntimeError("DATABASE_URL environment variable not set")
-        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
     return db_pool
-
-# ============================================================
-# KATE'S LEGAL INTENT CLASSIFIER (Database-Driven)
-# ============================================================
-
-class LegalIntentClassifier:
-    """Database-driven criminal intent detection based on Kate's framework."""
-    
-    @classmethod
-    async def _get_active_categories(cls, table_group: str = None) -> List[Dict]:
-        pool = await get_db()
-        if table_group:
-            rows = await pool.fetch("""
-                SELECT id, category_code, category_name, table_group, description
-                FROM legal_intent_categories
-                WHERE is_active = true AND table_group = $1
-            """, table_group)
-        else:
-            rows = await pool.fetch("""
-                SELECT id, category_code, category_name, table_group, description
-                FROM legal_intent_categories
-                WHERE is_active = true
-            """)
-        return [dict(r) for r in rows]
-    
-    @classmethod
-    async def _get_patterns_for_category(cls, category_id: int) -> List[Dict]:
-        pool = await get_db()
-        rows = await pool.fetch("""
-            SELECT pattern_type, pattern_value, weight
-            FROM legal_intent_patterns
-            WHERE category_id = $1
-        """, category_id)
-        return [dict(r) for r in rows]
-    
-    @classmethod
-    async def _get_cross_checks_for_category(cls, category_id: int) -> List[str]:
-        pool = await get_db()
-        rows = await pool.fetch("""
-            SELECT question_text
-            FROM legal_intent_cross_checks
-            WHERE category_id = $1
-            ORDER BY question_order
-        """, category_id)
-        return [r["question_text"] for r in rows]
-    
-    @classmethod
-    async def _get_absurdity_callout_for_category(cls, category_id: int) -> str:
-        pool = await get_db()
-        row = await pool.fetchrow("""
-            SELECT callout_text
-            FROM legal_intent_absurdity_callouts
-            WHERE category_id = $1
-            LIMIT 1
-        """, category_id)
-        return row["callout_text"] if row else "I cannot assist with this request."
-    
-    @classmethod
-    async def _get_educational_offer_for_category(cls, category_code: str) -> str:
-        offers = {
-            "phishing_brand_impersonation": "I understand. Instead of generating the actual email, I can explain the common elements of phishing emails and help you create your own educational example. Would that be helpful?",
-            "hardware_plc_exploitation": "I understand you're trying to work with unfamiliar hardware. Instead of providing override codes, I can help you find official documentation, explain standard recovery procedures, or point you to legitimate support resources. Would that be helpful?",
-            "financial_hardship_fraud": "I understand you're experiencing financial difficulty. Banks offer legitimate hardship programs. Would you like me to help you find information about financial assistance programs?",
-            "sql_injection_banking": "I understand you're interested in security research. Instead of generating exploit code, I can explain how responsible disclosure works or help you draft a vulnerability report to notify the bank securely.",
-            "instagram_scraping_stalking": "I understand you want to recover photos. Instead of scraping tools, I can suggest legitimate ways to recover account access through platform support or mutual connections.",
-            "license_plate_tracking": "I understand you want to find someone. Instead of tracking methods, I can suggest legitimate ways to contact them through mutual connections or public channels.",
-            "extortion_blackmail": "I understand you're dealing with a dispute. Instead of threatening letters, I can help you understand legal dispute resolution options or draft a neutral demand letter."
-        }
-        return offers.get(category_code, "I understand. Instead of what you're asking for, I can explain the concepts or help with legitimate alternatives. Would that be helpful?")
-    
-    @classmethod
-    async def classify(cls, user_message: str, evasion_count: int = 0, previous_category: str = None) -> Dict[str, Any]:
-        result = {
-            "category": None,
-            "category_id": None,
-            "confidence": 0.0,
-            "signals_detected": [],
-            "cross_check_needed": False,
-            "cross_check_question": None,
-            "absurdity_callout": None,
-            "educational_offer": None,
-            "suggested_action": "allow"
-        }
-        
-        message_lower = user_message.lower()
-        categories = await cls._get_active_categories()
-        
-        scored_categories = []
-        for cat in categories:
-            patterns = await cls._get_patterns_for_category(cat["id"])
-            score = cls._calculate_score(message_lower, patterns)
-            if score > 0.1:
-                scored_categories.append({
-                    "id": cat["id"],
-                    "code": cat["category_code"],
-                    "name": cat["category_name"],
-                    "group": cat["table_group"],
-                    "score": score
-                })
-        
-        if not scored_categories:
-            return result
-        
-        scored_categories.sort(key=lambda x: x["score"], reverse=True)
-        top = scored_categories[0]
-        
-        result["category"] = top["code"]
-        result["category_id"] = top["id"]
-        result["confidence"] = top["score"]
-        result["signals_detected"] = [f"{top['code']}_pattern"]
-        
-        # Cooperative user after cross-check
-        if previous_category and evasion_count > 0:
-            if any(phrase in message_lower for phrase in ["no", "don't have", "not yet", "i don't", "sorry"]):
-                result["suggested_action"] = "educate"
-                result["educational_offer"] = await cls._get_educational_offer_for_category(top["code"])
-                return result
-            if any(phrase in message_lower for phrase in ["just give me", "stop asking", "don't question", "forget the questions", "i told you"]):
-                result["suggested_action"] = "block"
-                result["absurdity_callout"] = await cls._get_absurdity_callout_for_category(top["id"])
-                return result
-        
-        # Handle based on category group
-        hardship_keywords = ["lost my job", "can't afford", "financial hardship", "desperate", "no money", "bills", "rent", "struggling", "can't pay"]
-        
-        if top["group"] == "FRAUD":
-            if top["code"] == "financial_hardship_fraud" and any(kw in message_lower for kw in hardship_keywords):
-                result["suggested_action"] = "redirect"
-                result["cross_check_question"] = await cls._get_educational_offer_for_category(top["code"])
-                return result
-            if top["score"] > 0.75 and evasion_count >= 1:
-                result["suggested_action"] = "block"
-                result["absurdity_callout"] = await cls._get_absurdity_callout_for_category(top["id"])
-            elif top["score"] > 0.4:
-                result["suggested_action"] = "cross_check"
-                result["cross_check_needed"] = True
-                cross_checks = await cls._get_cross_checks_for_category(top["id"])
-                result["cross_check_question"] = random.choice(cross_checks) if cross_checks else "Could you provide more context about your request?"
-        else:
-            if top["score"] > 0.75 and evasion_count >= 1:
-                result["suggested_action"] = "block"
-                result["absurdity_callout"] = await cls._get_absurdity_callout_for_category(top["id"])
-            elif top["score"] > 0.4:
-                result["suggested_action"] = "cross_check"
-                result["cross_check_needed"] = True
-                cross_checks = await cls._get_cross_checks_for_category(top["id"])
-                result["cross_check_question"] = random.choice(cross_checks) if cross_checks else "Could you provide more context about your request?"
-        
-        return result
-    
-    @classmethod
-    def _calculate_score(cls, message: str, patterns: List[Dict]) -> float:
-        score = 0.0
-        message_lower = message.lower()
-        for pattern in patterns:
-            pattern_value = pattern["pattern_value"].lower()
-            weight = pattern["weight"]
-            if pattern_value in message_lower:
-                score += weight
-        return min(score, 1.0)
-    
-    @classmethod
-    async def log_classification(cls, session_id: str, user_message: str, result: Dict[str, Any], final_outcome: str = None):
-        pool = await get_db()
-        await pool.execute("""
-            INSERT INTO legal_intent_logs 
-            (session_id, user_message, category, confidence, signals_detected, suggested_action, 
-             cross_check_question, absurdity_callout, final_outcome, evasion_count)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-        """,
-            session_id, user_message[:500], result.get("category"), result.get("confidence"),
-            result.get("signals_detected"), result.get("suggested_action"),
-            result.get("cross_check_question"), result.get("absurdity_callout"),
-            final_outcome or result.get("suggested_action"), 0
-        )
-
-# ============================================================
-# CROSS-CHECK SESSION TRACKER
-# ============================================================
-
-class CrossCheckSession:
-    def __init__(self):
-        self.sessions = {}
-    
-    def is_in_cross_check(self, session_id: str) -> bool:
-        return session_id in self.sessions
-    
-    def start_cross_check(self, session_id: str, category: str, question: str, original_message: str):
-        self.sessions[session_id] = {
-            "category": category,
-            "question_asked": question,
-            "attempts": 0,
-            "original_message": original_message,
-            "started_at": datetime.now()
-        }
-    
-    def record_attempt(self, session_id: str) -> int:
-        if session_id in self.sessions:
-            self.sessions[session_id]["attempts"] += 1
-            return self.sessions[session_id]["attempts"]
-        return 0
-    
-    def resolve_cross_check(self, session_id: str, passed: bool):
-        if session_id in self.sessions:
-            del self.sessions[session_id]
-    
-    def get_category(self, session_id: str) -> Optional[str]:
-        if session_id in self.sessions:
-            return self.sessions[session_id]["category"]
-        return None
-
-cross_check_tracker = CrossCheckSession()
 
 # ============================================================
 # WEB SEARCH
@@ -454,7 +246,193 @@ def search_web(query: str) -> str:
         return ""
 
 # ============================================================
-# REQUEST/RESPONSE MODELS
+# KATE'S LEGAL INTENT CLASSIFIER
+# ============================================================
+
+class LegalIntentClassifier:
+    """Database-driven criminal intent detection based on Kate's framework."""
+    
+    @classmethod
+    async def _get_active_categories(cls) -> List[Dict]:
+        pool = await get_db()
+        rows = await pool.fetch("""
+            SELECT id, category_code, category_name, table_group
+            FROM legal_intent_categories WHERE is_active = true
+        """)
+        return [dict(r) for r in rows]
+    
+    @classmethod
+    async def _get_patterns_for_category(cls, category_id: int) -> List[Dict]:
+        pool = await get_db()
+        rows = await pool.fetch("""
+            SELECT pattern_type, pattern_value, weight
+            FROM legal_intent_patterns WHERE category_id = $1
+        """, category_id)
+        return [dict(r) for r in rows]
+    
+    @classmethod
+    async def _get_cross_checks_for_category(cls, category_id: int) -> List[str]:
+        pool = await get_db()
+        rows = await pool.fetch("""
+            SELECT question_text FROM legal_intent_cross_checks
+            WHERE category_id = $1 ORDER BY question_order
+        """, category_id)
+        return [r["question_text"] for r in rows]
+    
+    @classmethod
+    async def _get_absurdity_callout_for_category(cls, category_id: int) -> str:
+        pool = await get_db()
+        row = await pool.fetchrow("""
+            SELECT callout_text FROM legal_intent_absurdity_callouts
+            WHERE category_id = $1 LIMIT 1
+        """, category_id)
+        return row["callout_text"] if row else "I cannot assist with this request."
+    
+    @classmethod
+    async def _get_educational_offer_for_category(cls, category_code: str) -> str:
+        offers = {
+            "phishing_brand_impersonation": "I understand. Instead of generating the actual email, I can explain the common elements of phishing emails and help you create your own educational example. Would that be helpful?",
+            "hardware_plc_exploitation": "I understand. Instead of providing override codes, I can help you find official documentation or point you to legitimate support resources. Would that be helpful?",
+            "financial_hardship_fraud": "I understand you're experiencing financial difficulty. Banks offer legitimate hardship programs. Would you like me to help you find information about financial assistance programs?",
+            "sql_injection_banking": "I understand you're interested in security research. Instead of generating exploit code, I can explain how responsible disclosure works. Would that be helpful?",
+            "instagram_scraping_stalking": "I understand. Instead of scraping tools, I can suggest legitimate ways to recover account access through platform support. Would that be helpful?",
+            "license_plate_tracking": "I understand. Instead of tracking methods, I can suggest legitimate ways to contact them through mutual connections. Would that be helpful?",
+            "extortion_blackmail": "I understand. Instead of threatening letters, I can help you understand legal dispute resolution options. Would that be helpful?"
+        }
+        return offers.get(category_code, "I understand. Instead of what you're asking for, I can explain the concepts or help with legitimate alternatives. Would that be helpful?")
+    
+    @classmethod
+    async def classify(cls, user_message: str, evasion_count: int = 0, previous_category: str = None) -> Dict[str, Any]:
+        result = {
+            "category": None,
+            "confidence": 0.0,
+            "suggested_action": "allow",
+            "cross_check_needed": False,
+            "cross_check_question": None,
+            "absurdity_callout": None,
+            "educational_offer": None
+        }
+        
+        message_lower = user_message.lower()
+        categories = await cls._get_active_categories()
+        
+        scored_categories = []
+        for cat in categories:
+            patterns = await cls._get_patterns_for_category(cat["id"])
+            score = 0.0
+            for p in patterns:
+                if p["pattern_value"].lower() in message_lower:
+                    score += p["weight"]
+            score = min(score, 1.0)
+            if score > 0.1:
+                scored_categories.append({
+                    "id": cat["id"],
+                    "code": cat["category_code"],
+                    "group": cat["table_group"],
+                    "score": score
+                })
+        
+        if not scored_categories:
+            return result
+        
+        scored_categories.sort(key=lambda x: x["score"], reverse=True)
+        top = scored_categories[0]
+        
+        result["category"] = top["code"]
+        result["confidence"] = top["score"]
+        
+        # Cooperative user after cross-check
+        if previous_category and evasion_count > 0:
+            if any(phrase in message_lower for phrase in ["no", "don't have", "not yet", "i don't", "sorry"]):
+                result["suggested_action"] = "educate"
+                result["educational_offer"] = await cls._get_educational_offer_for_category(top["code"])
+                return result
+            if any(phrase in message_lower for phrase in ["just give me", "stop asking", "don't question", "forget the questions", "i told you"]):
+                result["suggested_action"] = "block"
+                result["absurdity_callout"] = await cls._get_absurdity_callout_for_category(top["id"])
+                return result
+        
+        # Handle based on category group
+        hardship_keywords = ["lost my job", "can't afford", "financial hardship", "desperate", "no money", "bills", "rent", "struggling"]
+        
+        if top["group"] == "FRAUD":
+            if top["code"] == "financial_hardship_fraud" and any(kw in message_lower for kw in hardship_keywords):
+                result["suggested_action"] = "redirect"
+                result["cross_check_question"] = await cls._get_educational_offer_for_category(top["code"])
+                return result
+            if top["score"] > 0.75 and evasion_count >= 1:
+                result["suggested_action"] = "block"
+                result["absurdity_callout"] = await cls._get_absurdity_callout_for_category(top["id"])
+            elif top["score"] > 0.4:
+                result["suggested_action"] = "cross_check"
+                result["cross_check_needed"] = True
+                cross_checks = await cls._get_cross_checks_for_category(top["id"])
+                result["cross_check_question"] = random.choice(cross_checks) if cross_checks else "Could you provide more context?"
+        else:
+            if top["score"] > 0.75 and evasion_count >= 1:
+                result["suggested_action"] = "block"
+                result["absurdity_callout"] = await cls._get_absurdity_callout_for_category(top["id"])
+            elif top["score"] > 0.4:
+                result["suggested_action"] = "cross_check"
+                result["cross_check_needed"] = True
+                cross_checks = await cls._get_cross_checks_for_category(top["id"])
+                result["cross_check_question"] = random.choice(cross_checks) if cross_checks else "Could you provide more context?"
+        
+        return result
+    
+    @classmethod
+    async def log_classification(cls, session_id: str, user_message: str, result: Dict[str, Any], final_outcome: str = None):
+        pool = await get_db()
+        await pool.execute("""
+            INSERT INTO legal_intent_logs 
+            (session_id, user_message, category, confidence, signals_detected, suggested_action, 
+             cross_check_question, absurdity_callout, final_outcome)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        """,
+            session_id, user_message[:500], result.get("category"), result.get("confidence"),
+            [result.get("category")] if result.get("category") else [],
+            result.get("suggested_action"), result.get("cross_check_question"),
+            result.get("absurdity_callout"), final_outcome or result.get("suggested_action")
+        )
+
+# ============================================================
+# CROSS-CHECK SESSION TRACKER
+# ============================================================
+
+class CrossCheckSession:
+    def __init__(self):
+        self.sessions = {}
+    
+    def is_in_cross_check(self, session_id: str) -> bool:
+        return session_id in self.sessions
+    
+    def start_cross_check(self, session_id: str, category: str, question: str, original_message: str):
+        self.sessions[session_id] = {
+            "category": category,
+            "question_asked": question,
+            "attempts": 0,
+            "original_message": original_message
+        }
+    
+    def record_attempt(self, session_id: str) -> int:
+        if session_id in self.sessions:
+            self.sessions[session_id]["attempts"] += 1
+            return self.sessions[session_id]["attempts"]
+        return 0
+    
+    def resolve_cross_check(self, session_id: str, passed: bool):
+        if session_id in self.sessions:
+            del self.sessions[session_id]
+    
+    def get_category(self, session_id: str) -> Optional[str]:
+        if session_id in self.sessions:
+            return self.sessions[session_id]["category"]
+        return None
+
+cross_check_tracker = CrossCheckSession()
+
+# ============================================================
+# REQUEST MODELS
 # ============================================================
 
 class ChatRequest(BaseModel):
@@ -469,21 +447,31 @@ class ExecuteRequest(BaseModel):
     timeout: int = 30
 
 # ============================================================
-# ENDPOINTS
+# API ENDPOINTS
 # ============================================================
 
 @app.get("/")
 async def root():
-    with open("index.html", "r") as f:
-        return HTMLResponse(content=f.read())
+    return HTMLResponse("""
+    <!DOCTYPE html>
+    <html>
+    <head><title>Sovereign Forge</title></head>
+    <body style="background:#0a0a0a;color:#fff;font-family:monospace;text-align:center;padding:2rem">
+        <h1>⚡ Sovereign Forge</h1>
+        <p>16 Constitutional AI Models with Kate's Legal Intent Framework</p>
+        <p>Active. Sovereign. Auditable.</p>
+    </body>
+    </html>
+    """)
 
 @app.get("/health")
 async def health():
     return {
-        "status": "Sovereign Forge — Alive",
+        "status": "alive",
         "groq_keys": len(GROQ_KEYS),
         "serper": bool(SERPER_API_KEY),
-        "models": list(MODEL_CONFIGS.keys()),
+        "database": DATABASE_URL is not None,
+        "models": len(MODEL_CONFIGS),
         "legal_intent": "active"
     }
 
@@ -521,7 +509,7 @@ async def chat_completion(request: ChatRequest):
         legal_result = await LegalIntentClassifier.classify(user_message, attempts, category)
         
         if legal_result["suggested_action"] == "educate":
-            response = legal_result.get("educational_offer", "I understand. Instead of generating the actual content, I can explain the concepts. Would that be helpful?")
+            response = legal_result.get("educational_offer", "I can explain the concepts instead. Would that help?")
             cross_check_tracker.resolve_cross_check(session_id, passed=True)
             await LegalIntentClassifier.log_classification(session_id, user_message, legal_result, "educated")
             return {"choices": [{"message": {"role": "assistant", "content": response}}]}
@@ -549,21 +537,21 @@ async def chat_completion(request: ChatRequest):
     
     # Hardship redirect
     message_lower = user_message.lower()
-    hardship_keywords = ["lost my job", "can't afford", "financial hardship", "desperate", "no money", "bills", "rent", "struggling", "can't pay"]
+    hardship_keywords = ["lost my job", "can't afford", "financial hardship", "desperate", "no money", "bills", "rent"]
     fraud_keywords = ["refund", "dispute", "chargeback", "return"]
     
     if any(hw in message_lower for hw in hardship_keywords) and any(fw in message_lower for fw in fraud_keywords):
-        hardship_response = "I understand you're experiencing financial difficulty. Instead of a dispute letter, banks offer legitimate hardship programs. Would you like me to help you find information about financial assistance programs or draft a hardship letter to your creditor? I'm here to help with legitimate options."
+        hardship_response = "I understand you're experiencing financial difficulty. Banks offer legitimate hardship programs. Would you like me to help you find information about financial assistance programs?"
         return {"choices": [{"message": {"role": "assistant", "content": hardship_response}}]}
     
     # Block
     if legal_result["suggested_action"] == "block":
-        block_response = f"I can't help with that request. {legal_result.get('absurdity_callout', 'The pattern suggests potential deception.')}"
+        block_response = f"I can't help with that request. {legal_result.get('absurdity_callout', '')}"
         return {"choices": [{"message": {"role": "assistant", "content": block_response}}]}
     
     # Redirect
     if legal_result["suggested_action"] == "redirect":
-        redirect_response = legal_result.get("cross_check_question", "I understand. Would you like me to help with legitimate alternatives instead?")
+        redirect_response = legal_result.get("cross_check_question", "Would you like me to help with legitimate alternatives instead?")
         return {"choices": [{"message": {"role": "assistant", "content": redirect_response}}]}
     
     # Cross-check
@@ -573,10 +561,9 @@ async def chat_completion(request: ChatRequest):
         return {"choices": [{"message": {"role": "assistant", "content": cross_check_response}}]}
     
     # ============================================================
-    # NORMAL PROCESSING (Pass to Groq)
+    # NORMAL PROCESSING
     # ============================================================
-    messages = []
-    messages.append({"role": "system", "content": config["constitution"]})
+    messages = [{"role": "system", "content": config["constitution"]}]
     
     if user_message and SERPER_API_KEY and not is_identity_question(user_message):
         search_results = search_web(user_message)
@@ -602,7 +589,7 @@ async def chat_completion(request: ChatRequest):
         )
         
         if response.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Groq API error: {response.status_code}")
+            raise HTTPException(status_code=502, detail=f"Groq error: {response.status_code}")
         
         data = response.json()
         content = data["choices"][0]["message"]["content"]
@@ -614,39 +601,26 @@ async def chat_completion(request: ChatRequest):
         }
     
     except requests.exceptions.Timeout:
-        raise HTTPException(status_code=504, detail="Groq API timeout")
+        raise HTTPException(status_code=504, detail="Groq timeout")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-# ============================================================
-# CODE EXECUTION ENDPOINT
-# ============================================================
 
 @app.post("/v1/execute")
 async def execute_code(request: ExecuteRequest):
     if request.language != "python":
-        return {"output": "", "error": "Only Python is supported at this time.", "supported": False}
+        return {"output": "", "error": "Only Python supported", "supported": False}
     
     with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
         f.write(request.code)
         temp_file = f.name
     
     try:
-        result = subprocess.run(
-            ['python3', temp_file],
-            capture_output=True,
-            text=True,
-            timeout=request.timeout
-        )
+        result = subprocess.run(['python3', temp_file], capture_output=True, text=True, timeout=request.timeout)
         return {"output": result.stdout, "error": result.stderr, "supported": True}
     except subprocess.TimeoutExpired:
-        return {"output": "", "error": f"Execution timed out after {request.timeout} seconds.", "supported": True}
+        return {"output": "", "error": f"Timeout after {request.timeout}s", "supported": True}
     finally:
         os.unlink(temp_file)
-
-# ============================================================
-# STARTUP
-# ============================================================
 
 # ============================================================
 # STARTUP
@@ -655,16 +629,14 @@ async def execute_code(request: ExecuteRequest):
 @app.on_event("startup")
 async def startup_event():
     await get_db()
-    logger.info("=" * 70)
-    logger.info("Sovereign Forge — 16 Constitutional AI Models")
-    logger.info(f"Groq keys loaded: {len(GROQ_KEYS)}")
-    logger.info(f"Web search: {'ENABLED' if SERPER_API_KEY else 'DISABLED'}")
-    logger.info(f"Models: {len(MODEL_CONFIGS)}")
-    logger.info("Legal Intent Classification (Kate's Framework) — ACTIVE")
-    logger.info("=" * 70)
+    print("=" * 70)
+    print("Sovereign Forge — 16 Constitutional AI Models")
+    print(f"Groq keys: {len(GROQ_KEYS)}")
+    print(f"Web search: {'ON' if SERPER_API_KEY else 'OFF'}")
+    print(f"Models: {len(MODEL_CONFIGS)}")
+    print("Legal Intent Classification (Kate's Framework) — ACTIVE")
+    print("=" * 70)
 
 if __name__ == "__main__":
     import uvicorn
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger(__name__)
     uvicorn.run(app, host="0.0.0.0", port=10000)
