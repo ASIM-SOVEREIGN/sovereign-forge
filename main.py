@@ -22,7 +22,6 @@ from typing import Optional, List, Dict, Any, Tuple
 from collections import defaultdict
 from pydantic import BaseModel
 import asyncpg
-import httpx
 
 # ============================================================
 # APP SETUP
